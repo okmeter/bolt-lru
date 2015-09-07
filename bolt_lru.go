@@ -56,58 +56,82 @@ func New(size int, dbPath string) (*Cache, error) {
 }
 
 func (c *Cache) Add(key string, value []byte) error {
-	c.lock.Lock()
-	defer c.lock.Unlock()
+	return c.AddMulti(map[string][]byte{key: value})
+}
 
-	if el, ok := c.items[key]; ok {
-		c.evictList.MoveToFront(el)
-	} else {
-		el := c.evictList.PushFront(key)
-		c.items[key] = el
-		evict := c.evictList.Len() > c.size
-		if evict {
-			err := c.removeOldest()
+func (c *Cache) AddMulti(data map[string][]byte) error {
+	keysToRemove := make([]string, 0)
+	c.lock.Lock()
+	for key, _ := range data {
+		if el, ok := c.items[key]; ok {
+			c.evictList.MoveToFront(el)
+		} else {
+			el := c.evictList.PushFront(key)
+			c.items[key] = el
+			evict := c.evictList.Len() > c.size
+			if evict {
+				el := c.evictList.Back()
+				if el != nil {
+					key := el.Value.(string)
+					c.evictList.Remove(el)
+					delete(c.items, key)
+					keysToRemove = append(keysToRemove, key)
+				}
+			}
+		}
+	}
+	c.lock.Unlock()
+	return c.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketName)
+		var err error
+		for _, k := range keysToRemove {
+			err = b.Delete([]byte(k))
 			if err != nil {
 				return err
 			}
 		}
-	}
-	return c.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(bucketName)
-		return b.Put([]byte(key), value)
+
+		for key, value := range data {
+			err = b.Put([]byte(key), value)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 }
 
 func (c *Cache) Get(key string) (value []byte, err error) {
-	c.lock.Lock()
-	defer c.lock.Unlock()
-
-	if el, ok := c.items[key]; ok {
-		err = c.db.View(func(tx *bolt.Tx) error {
-			b := tx.Bucket(bucketName)
-			value = b.Get([]byte(key))
-			return nil
-		})
-		if err == nil {
-			c.evictList.MoveToFront(el)
-		}
+	data, err := c.MultiGet([]string{key})
+	if err != nil {
 		return
 	}
-	return nil, errors.New("not found")
+	value, ok := data[key]
+	if !ok {
+		err = errors.New("not found")
+	}
+	return
 }
 
-func (c *Cache) removeOldest() error {
-	el := c.evictList.Back()
-	if el != nil {
-		key := el.Value.(string)
-		c.evictList.Remove(el)
-		delete(c.items, key)
-		return c.db.Update(func(tx *bolt.Tx) error {
-			b := tx.Bucket(bucketName)
-			return b.Delete([]byte(key))
-		})
+func (c *Cache) MultiGet(keys []string) (values map[string][]byte, err error) {
+	c.lock.Lock()
+	existsKeys := make([]string, 0, len(keys))
+	for _, k := range keys {
+		if el, ok := c.items[k]; ok {
+			existsKeys = append(existsKeys, k)
+			c.evictList.MoveToFront(el)
+		}
 	}
-	return nil
+	c.lock.Unlock()
+	values = make(map[string][]byte, len(existsKeys))
+	err = c.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketName)
+		for _, k := range existsKeys {
+			values[k] = b.Get([]byte(k))
+		}
+		return nil
+	})
+	return
 }
 
 func (c *Cache) Len() int {
