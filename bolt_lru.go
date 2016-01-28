@@ -139,3 +139,7 @@ func (c *Cache) Len() int {
 	defer c.lock.RUnlock()
 	return c.evictList.Len()
 }
+
+func (c *Cache) Close() {
+	c.db.Close()
+}
